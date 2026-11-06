@@ -33,11 +33,16 @@
 #include <cstdlib>
 #include <csignal>
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <ctime>
+#include <tuple>
 
 // ── POSIX / Socket headers ────────────────────────────────────
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -53,6 +58,7 @@
 constexpr uint64_t ALERT_BW_THRESHOLD_BYTES = 10 * 1024 * 1024; // 10 MB/s
 constexpr uint32_t ALERT_CONN_THRESHOLD      = 500;              // connections
 constexpr int      REFRESH_INTERVAL_SEC      = 1;
+constexpr size_t   MAX_TRACKED_CONNECTIONS   = 10000;
 
 // ─────────────────────────────────────────────────────────────
 //  Data Structures
@@ -162,10 +168,17 @@ void capture_thread() {
                 g_stats.icmp_packets++;
             }
 
-            auto& conn       = g_stats.connections[key];
-            conn.bytes      += pkt_size;
-            conn.packets    += 1;
-            conn.last_seen   = std::chrono::steady_clock::now();
+            auto it = g_stats.connections.find(key);
+            if (it != g_stats.connections.end()) {
+                it->second.bytes += pkt_size;
+                it->second.packets += 1;
+                it->second.last_seen = std::chrono::steady_clock::now();
+            } else if (g_stats.connections.size() < MAX_TRACKED_CONNECTIONS) {
+                auto& conn = g_stats.connections[key];
+                conn.bytes = pkt_size;
+                conn.packets = 1;
+                conn.last_seen = std::chrono::steady_clock::now();
+            }
 
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
@@ -173,13 +186,31 @@ void capture_thread() {
     }
 
     // ── Real capture mode ────────────────────────────────────
+    timeval receive_timeout{};
+    receive_timeout.tv_sec = 1;
+    receive_timeout.tv_usec = 0;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout)) < 0) {
+        std::cerr << "[WARN] Could not set receive timeout; capture may take longer to stop.\\n";
+    }
+
     char buffer[65536];
     while (g_running) {
         ssize_t len = recv(sock, buffer, sizeof(buffer), 0);
-        if (len <= 0) continue;
+        if (len < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (g_running) std::cerr << "[WARN] Packet receive failed; stopping capture.\\n";
+            break;
+        }
+        if (len == 0 || static_cast<size_t>(len) < sizeof(struct iphdr)) continue;
 
         struct iphdr* iph = reinterpret_cast<struct iphdr*>(buffer);
-        if (static_cast<size_t>(len) < sizeof(struct iphdr)) continue;
+        if (iph->version != 4 || iph->ihl < 5) continue;
+        int ip_hdr_len = iph->ihl * 4;
+        uint64_t pkt_len = static_cast<uint64_t>(ntohs(iph->tot_len));
+        if (ip_hdr_len < static_cast<int>(sizeof(struct iphdr)) ||
+            static_cast<size_t>(ip_hdr_len) > static_cast<size_t>(len) ||
+            pkt_len < static_cast<uint64_t>(ip_hdr_len) ||
+            pkt_len > static_cast<uint64_t>(len)) continue;
 
         char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
         struct in_addr src_addr, dst_addr;
@@ -192,9 +223,6 @@ void capture_thread() {
         key.src_ip = src_ip;
         key.dst_ip = dst_ip;
 
-        uint64_t pkt_len = static_cast<uint64_t>(ntohs(iph->tot_len));
-        int ip_hdr_len   = iph->ihl * 4;
-
         std::lock_guard<std::mutex> lk(g_mutex);
         g_stats.total_bytes   += pkt_len;
         g_stats.total_packets += 1;
@@ -203,20 +231,35 @@ void capture_thread() {
             case IPPROTO_TCP: {
                 g_stats.tcp_packets++;
                 key.protocol = "TCP";
-                if (static_cast<ssize_t>(ip_hdr_len + (int)sizeof(struct tcphdr)) <= len) {
+                if (pkt_len >= static_cast<uint64_t>(ip_hdr_len + static_cast<int>(sizeof(struct tcphdr)))) {
                     struct tcphdr* tcph = reinterpret_cast<struct tcphdr*>(buffer + ip_hdr_len);
-                    key.src_port = ntohs(tcph->th_sport);
-                    key.dst_port = ntohs(tcph->th_dport);
+                    const size_t tcp_header_len = static_cast<size_t>(tcph->doff) * 4;
+                    if (tcph->doff >= 5 && tcp_header_len <= pkt_len - static_cast<uint64_t>(ip_hdr_len)) {
+                        key.src_port = ntohs(tcph->th_sport);
+                        key.dst_port = ntohs(tcph->th_dport);
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
                 }
                 break;
             }
             case IPPROTO_UDP: {
                 g_stats.udp_packets++;
                 key.protocol = "UDP";
-                if (static_cast<ssize_t>(ip_hdr_len + (int)sizeof(struct udphdr)) <= len) {
+                if (pkt_len >= static_cast<uint64_t>(ip_hdr_len + static_cast<int>(sizeof(struct udphdr)))) {
                     struct udphdr* udph = reinterpret_cast<struct udphdr*>(buffer + ip_hdr_len);
-                    key.src_port = ntohs(udph->uh_sport);
-                    key.dst_port = ntohs(udph->uh_dport);
+                    const uint16_t udp_len = ntohs(udph->uh_ulen);
+                    if (udp_len >= sizeof(struct udphdr) &&
+                        udp_len <= pkt_len - static_cast<uint64_t>(ip_hdr_len)) {
+                        key.src_port = ntohs(udph->uh_sport);
+                        key.dst_port = ntohs(udph->uh_dport);
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
                 }
                 break;
             }
@@ -231,10 +274,17 @@ void capture_thread() {
                 key.src_port = key.dst_port = 0;
         }
 
-        auto& conn     = g_stats.connections[key];
-        conn.bytes    += pkt_len;
-        conn.packets  += 1;
-        conn.last_seen = std::chrono::steady_clock::now();
+        auto it = g_stats.connections.find(key);
+        if (it != g_stats.connections.end()) {
+            it->second.bytes += pkt_len;
+            it->second.packets += 1;
+            it->second.last_seen = std::chrono::steady_clock::now();
+        } else if (g_stats.connections.size() < MAX_TRACKED_CONNECTIONS) {
+            auto& conn = g_stats.connections[key];
+            conn.bytes = pkt_len;
+            conn.packets = 1;
+            conn.last_seen = std::chrono::steady_clock::now();
+        }
     }
     close(sock);
 }
@@ -301,7 +351,7 @@ void display_thread() {
             double pct = 100.0 * count / total_pkt;
             int    bar = static_cast<int>(pct / 2.5);
             std::cout << "│  " << std::left << std::setw(6) << name
-                      << " [" << std::string(bar, '█') << std::string(40 - bar, ' ')
+                      << " [" << std::string(static_cast<size_t>(bar), '#') << std::string(40 - bar, ' ')
                       << "] " << std::right << std::setw(6) << std::fixed
                       << std::setprecision(1) << pct << "%  (" << count << ")\n";
         };
