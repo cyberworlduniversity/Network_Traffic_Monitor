@@ -1,5 +1,15 @@
 # 🌐 Network Traffic Monitor
 
+
+## Get this repository
+
+Clone the current project (this repository's canonical GitHub URL), then follow the installation and usage steps below.
+
+```bash
+git clone https://github.com/cyberworlduniversity/Network_Traffic_Monitor.git
+cd Network_Traffic_Monitor
+```
+
 **Author:** hemanathan115  
 **Language:** C++ (C++17)  
 **Platform:** Linux / macOS  
