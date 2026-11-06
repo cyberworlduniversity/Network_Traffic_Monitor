@@ -148,3 +148,48 @@ MIT License — Free to use, modify, and distribute.
 ---
 
 *Built with ❤️ by hemanathan115*
+
+
+## Repository Quick Start
+
+Clone the canonical repository:
+
+```bash
+git clone https://github.com/cyberworlduniversity/Network_Traffic_Monitor.git
+cd Network_Traffic_Monitor
+```
+
+### Requirements
+
+- C++17 compiler (g++ or clang++) and POSIX/Linux networking headers
+
+### Install dependencies / compile
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic -o network_monitor Network_Traffic_Monitor.cpp -pthread
+./network_monitor
+```
+
+### Run
+
+```bash
+For live raw-socket capture, run with the required administrator/root privileges. If supported by the program, use its simulation mode for a safe non-privileged first run.
+```
+
+Use the examples and options documented above; run a small, authorized test first. A dedicated automated test suite is not currently documented in this repository, so do not interpret a successful compile as proof of runtime correctness.
+
+Live capture may expose sensitive traffic. Capture only networks and interfaces you are authorized to monitor.
+
+### Program flow
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Check prerequisites]
+    B --> C{Build and input valid?}
+    C -- No --> D[Report error and stop]
+    C -- Yes --> E[Execute Network Traffic Monitor task]
+    E --> F[Generate output or findings]
+    F --> G[Review results]
+    G --> H[Exit]
+    D --> H
+```
